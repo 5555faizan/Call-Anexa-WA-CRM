@@ -1,7 +1,7 @@
 // File: d:/Call Anexa/faizan-langar/frontend/src/UnifiedInbox.jsx
 import React, { useEffect, useState, useRef, useMemo } from 'react';
 import axios from 'axios';
-import { MessageSquare, Users, CheckCircle2, Filter, Search, Tag, FileText, Edit2 } from 'lucide-react';
+import { MessageSquare, Users, CheckCircle2, Filter, Search, Tag, FileText, Edit2, X, Info, Plus, Trash2, ChevronDown, MoreVertical } from 'lucide-react';
 import WhatsAppInput from './WhatsAppInput';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:3001';
@@ -34,6 +34,19 @@ export default function UnifiedInbox({ sessions, socket }) {
   const [input, setInput] = useState('');
   const scrollerRef = useRef(null);
   const [loadingChats, setLoadingChats] = useState(true);
+  const [showNoteEditor, setShowNoteEditor] = useState(false);
+  const [customLabels, setCustomLabels] = useState([]);
+  const [manageLabelsModalOpen, setManageLabelsModalOpen] = useState(false);
+  const [newLabelName, setNewLabelName] = useState('');
+  const [newLabelColor, setNewLabelColor] = useState('#3b82f6');
+  const [labelSearch, setLabelSearch] = useState('');
+  const labelColors = ['#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#6b7280'];
+  const [showColorPicker, setShowColorPicker] = useState(false);
+  const [showLabelDropdown, setShowLabelDropdown] = useState(false);
+  const [activeMenuId, setActiveMenuId] = useState(null);
+  const [editContactModalOpen, setEditContactModalOpen] = useState(false);
+  const [contactToEdit, setContactToEdit] = useState(null);
+  const [editContactName, setEditContactName] = useState('');
 
   // Fetch chats from ALL sessions on mount
   useEffect(() => {
@@ -51,12 +64,19 @@ export default function UnifiedInbox({ sessions, socket }) {
           .then(res => res.data.map(c => ({ ...c, sessionId: s.id, agentName: s.name })))
           .catch(() => [])
       );
+      const labelPromises = sessions.map(s =>
+        api.get(`/api/labels/${s.id}`)
+          .then(res => res.data)
+          .catch(() => [])
+      );
 
       const chatResults = await Promise.all(chatPromises);
       const contactResults = await Promise.all(contactPromises);
+      const labelResults = await Promise.all(labelPromises);
 
       setAllChats(chatResults.flat());
       setContacts(contactResults.flat());
+      setCustomLabels(labelResults.flat());
       setLoadingChats(false);
     };
 
@@ -99,6 +119,7 @@ export default function UnifiedInbox({ sessions, socket }) {
           const agentInfo = sessions.find(s => s.id === data.sessionId);
           updated.push({
             contact: data.contact,
+            contact_name: data.contact_name,
             sessionId: data.sessionId,
             agentName: agentInfo ? agentInfo.name : 'Unknown Agent',
             last_message: data.message.message_text,
@@ -111,14 +132,53 @@ export default function UnifiedInbox({ sessions, socket }) {
         }
         return updated;
       });
+
+      // 3. Update the CRM contacts list so it's instantly available without refresh
+      setContacts(prev => {
+        let foundContact = prev.find(c => c.session_id === data.sessionId && c.phone === data.contact);
+        if (!foundContact) {
+          const agentInfo = sessions.find(s => s.id === data.sessionId);
+          return [...prev, {
+            id: `contact-${Date.now()}`,
+            session_id: data.sessionId,
+            phone: data.contact,
+            name: data.contact_name || data.contact,
+            agentName: agentInfo ? agentInfo.name : 'Unknown Agent',
+            last_message: data.message.timestamp
+          }];
+        }
+        return prev.map(c => c.session_id === data.sessionId && c.phone === data.contact ? { ...c, last_message: data.message.timestamp, name: data.contact_name || c.name } : c);
+      });
     };
 
     socket.on('new_message', handleNewMessage);
-    return () => socket.off('new_message', handleNewMessage);
+    return () => {
+      socket.off('new_message', handleNewMessage);
+    };
   }, [socket, sessions]);
+
+  // Handle socket contact updates (e.g. for avatar_url)
+  useEffect(() => {
+    if (!socket) return;
+    const handleContactUpdated = (data) => {
+      setAllChats(prev => prev.map(chat => 
+        (chat.sessionId === data.sessionId && chat.contact === data.contact)
+          ? { ...chat, avatar_url: data.avatar_url }
+          : chat
+      ));
+      setContacts(prev => prev.map(c => 
+        (c.session_id === data.sessionId && c.phone === data.contact)
+          ? { ...c, avatar_url: data.avatar_url }
+          : c
+      ));
+    };
+    socket.on('contact_updated', handleContactUpdated);
+    return () => socket.off('contact_updated', handleContactUpdated);
+  }, [socket]);
 
   // When contact selected, load messages and mark as read
   useEffect(() => {
+    setShowNoteEditor(false);
     if (!selectedSessionId || !selectedContact) return;
     
     // Optimistically clear unread count in UI
@@ -138,17 +198,25 @@ export default function UnifiedInbox({ sessions, socket }) {
 
   // Build combined sorted list
   const combinedList = useMemo(() => {
-    const items = allChats.map(ch => ({
-      contact: ch.contact,
-      name: ch.contact.split('@')[0],
-      last_message: ch.last_message || '',
-      last_direction: ch.last_direction || '',
-      last_msg_time: ch.last_msg_time || 0,
-      unread_count: ch.unread_count || 0,
-      sessionId: ch.sessionId,
-      agentName: ch.agentName,
-      isGroup: ch.contact.endsWith('@g.us')
-    }));
+    const items = allChats.map(ch => {
+      const crmContact = contacts.find(c => c.phone === ch.contact && c.session_id === ch.sessionId);
+      const savedName = crmContact?.name || ch.contact_name;
+      const effectiveName = (savedName && savedName !== ch.contact) ? savedName : ch.contact.split('@')[0];
+      
+      return {
+        ...ch,
+        contact: ch.contact,
+        name: effectiveName,
+        last_message: ch.last_message || '',
+        last_direction: ch.last_direction || '',
+        last_msg_time: ch.last_msg_time || 0,
+        unread_count: ch.unread_count || 0,
+        sessionId: ch.sessionId,
+        agentName: ch.agentName,
+        isGroup: ch.contact.endsWith('@g.us'),
+        contact_name: savedName
+      };
+    });
 
     let filtered = items.filter(item =>
       !item.contact.endsWith('@g.us') &&
@@ -163,7 +231,7 @@ export default function UnifiedInbox({ sessions, socket }) {
     }
 
     return filtered.sort((a, b) => b.last_msg_time - a.last_msg_time);
-  }, [allChats, search, unreadOnly]);
+  }, [allChats, search, unreadOnly, contacts]);
 
   // CRM details for selected contact
   const crmDetails = useMemo(() => {
@@ -244,6 +312,48 @@ export default function UnifiedInbox({ sessions, socket }) {
     try {
       await api.post(`/api/contacts/${crmDetails.id}/update`, { notes: newNotes });
       setContacts(prev => prev.map(c => c.id === crmDetails.id ? { ...c, notes: newNotes } : c));
+    } catch (err) { console.error(err); }
+  };
+
+  const saveTagsBtn = async () => {
+    if (!crmDetails) return;
+    const el = document.getElementById('crm-tags-input');
+    if (!el) return;
+    const newTags = el.value;
+    try {
+      await api.post(`/api/contacts/${crmDetails.id}/update`, { tags: newTags });
+      setContacts(prev => prev.map(c => c.id === crmDetails.id ? { ...c, tags: newTags } : c));
+    } catch (err) { console.error(err); }
+  };
+
+  const clearTagsBtn = async () => {
+    if (!crmDetails) return;
+    const el = document.getElementById('crm-tags-input');
+    if (el) el.value = '';
+    try {
+      await api.post(`/api/contacts/${crmDetails.id}/update`, { tags: '' });
+      setContacts(prev => prev.map(c => c.id === crmDetails.id ? { ...c, tags: '' } : c));
+    } catch (err) { console.error(err); }
+  };
+
+  const saveNotesBtn = async () => {
+    if (!crmDetails) return;
+    const el = document.getElementById('crm-notes-input');
+    if (!el) return;
+    const newNotes = el.value;
+    try {
+      await api.post(`/api/contacts/${crmDetails.id}/update`, { notes: newNotes });
+      setContacts(prev => prev.map(c => c.id === crmDetails.id ? { ...c, notes: newNotes } : c));
+    } catch (err) { console.error(err); }
+  };
+
+  const clearNotesBtn = async () => {
+    if (!crmDetails) return;
+    const el = document.getElementById('crm-notes-input');
+    if (el) el.value = '';
+    try {
+      await api.post(`/api/contacts/${crmDetails.id}/update`, { notes: '' });
+      setContacts(prev => prev.map(c => c.id === crmDetails.id ? { ...c, notes: '' } : c));
     } catch (err) { console.error(err); }
   };
 
@@ -358,17 +468,77 @@ export default function UnifiedInbox({ sessions, socket }) {
                         setSelectedSessionId(chat.sessionId);
                       }}
                     >
-                      <div className={`livechat-avatar ${chat.isGroup ? 'group' : ''}`}>
-                        {chat.isGroup ? 'Gp' : contactName.slice(-4)}
+                      <div className={`livechat-avatar`}>
+                        {(() => {
+                          const avatar = chat.avatar_url || contacts.find(c => c.phone === chat.contact && c.session_id === chat.sessionId)?.avatar_url;
+                          if (avatar && avatar !== 'none' && avatar !== '') {
+                            return <img src={avatar} alt="DP" style={{width:'100%', height:'100%', borderRadius:'50%', objectFit:'cover'}} />;
+                          }
+                          return contactName.slice(-4);
+                        })()}
                       </div>
                       <div className="livechat-thread-details">
-                        <h4>{chat.contact}</h4>
+                        <h4>{(() => {
+                          const cname = chat.contact_name || contacts.find(c => c.phone === chat.contact && c.session_id === chat.sessionId)?.name;
+                          return (cname && cname !== chat.contact) ? cname : contactName;
+                        })()}</h4>
                         <p>{chat.last_message ? String(chat.last_message).slice(0, 40) : 'Empty thread'}</p>
                       </div>
                       <div className="livechat-thread-meta">
-                        <span className="livechat-thread-time">
-                          {chat.last_msg_time ? new Date(chat.last_msg_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
-                        </span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+                          <span className="livechat-thread-time">
+                            {chat.last_msg_time ? new Date(chat.last_msg_time).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Karachi' }) : ''}
+                          </span>
+                          <div 
+                            style={{ cursor: 'pointer', color: 'var(--text-muted)', position: 'relative' }}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setActiveMenuId(activeMenuId === `${chat.sessionId}-${chat.contact}` ? null : `${chat.sessionId}-${chat.contact}`);
+                            }}
+                          >
+                            <MoreVertical size={14} />
+                            {activeMenuId === `${chat.sessionId}-${chat.contact}` && (
+                              <div style={{ position: 'absolute', right: 0, top: '20px', background: '#252525', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '4px', zIndex: 50, padding: '0.25rem 0', minWidth: '120px', boxShadow: '0 4px 6px rgba(0,0,0,0.3)', textAlign: 'left' }}>
+                                <div 
+                                  style={{ padding: '0.5rem 1rem', fontSize: '0.8rem', color: '#fff', cursor: 'pointer' }}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setActiveMenuId(null);
+                                    setContactToEdit({
+                                      sessionId: chat.sessionId,
+                                      contact: chat.contact,
+                                      crmId: contacts.find(c => c.phone === chat.contact && c.session_id === chat.sessionId)?.id
+                                    });
+                                    const cname = chat.contact_name || contacts.find(c => c.phone === chat.contact && c.session_id === chat.sessionId)?.name;
+                                    setEditContactName((cname && cname !== chat.contact) ? cname : contactName);
+                                    setEditContactModalOpen(true);
+                                  }}
+                                >
+                                  {contacts.find(c => c.phone === chat.contact && c.session_id === chat.sessionId)?.name && contacts.find(c => c.phone === chat.contact && c.session_id === chat.sessionId)?.name !== chat.contact ? 'Edit Contact' : 'Save Contact'}
+                                </div>
+                                <div 
+                                  style={{ padding: '0.5rem 1rem', fontSize: '0.8rem', color: '#ef4444', cursor: 'pointer' }}
+                                  onClick={async (e) => {
+                                    e.stopPropagation();
+                                    setActiveMenuId(null);
+                                    if (window.confirm('Are you sure you want to delete this chat?')) {
+                                      try {
+                                        await api.delete(`/api/chats/${chat.sessionId}/${chat.contact}`);
+                                        setAllChats(prev => prev.filter(c => !(c.sessionId === chat.sessionId && c.contact === chat.contact)));
+                                        if (selectedContact === chat.contact && selectedSessionId === chat.sessionId) {
+                                          setSelectedContact('');
+                                          setSelectedSessionId('');
+                                        }
+                                      } catch (err) { alert('Failed to delete chat'); }
+                                    }
+                                  }}
+                                >
+                                  Delete Chat
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        </div>
                         {chat.unread_count > 0 ? (
                           <div style={{ 
                             background: '#25D366', 
@@ -386,9 +556,6 @@ export default function UnifiedInbox({ sessions, socket }) {
                             {chat.unread_count}
                           </div>
                         ) : null}
-                        <span style={{ fontSize: '0.6rem', color: 'var(--accent-light)', fontWeight: 600, marginTop: '0.15rem' }}>
-                          {chat.agentName}
-                        </span>
                       </div>
                     </div>
                   );
@@ -403,12 +570,24 @@ export default function UnifiedInbox({ sessions, socket }) {
               <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
                 <div className="livechat-chat-header">
                   <div>
-                    <h3>{selectedContact}</h3>
+                    <h3>{(() => {
+                      const cname = contacts.find(c => c.phone === selectedContact && c.session_id === selectedSessionId)?.name;
+                      return (cname && cname !== selectedContact) ? cname : selectedContact.split('@')[0];
+                    })()}</h3>
                     <p>via {selectedAgentInfo?.name || 'Agent'} • Live Sync Active</p>
                   </div>
-                  <span className="pill-indicator" style={{ background: 'var(--accent-glow)' }}>
-                    {selectedContact.endsWith('@g.us') ? 'WhatsApp Group' : 'Private Conversation'}
-                  </span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                    <span className="pill-indicator" style={{ background: 'var(--accent-glow)' }}>
+                      {selectedContact}
+                    </span>
+                    <button 
+                      onClick={() => { setSelectedContact(''); setSelectedSessionId(''); }} 
+                      style={{ background: 'transparent', border: 'none', color: '#ef4444', cursor: 'pointer', display: 'flex', alignItems: 'center', padding: '0.2rem', borderRadius: '4px' }}
+                      title="Close Chat"
+                    >
+                      <X size={18} />
+                    </button>
+                  </div>
                 </div>
 
                 <div className="livechat-messages-scroller" ref={scrollerRef}>
@@ -426,7 +605,7 @@ export default function UnifiedInbox({ sessions, socket }) {
                           )}
                           {renderMessageContent(msg)}
                           <span className="livechat-bubble-time">
-                            {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                            {new Date(msg.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Karachi' })}
                           </span>
                         </div>
                       </div>
@@ -446,9 +625,7 @@ export default function UnifiedInbox({ sessions, socket }) {
               </div>
             ) : (
               <div className="livechat-empty-chat">
-                <MessageSquare size={48} className="text-muted" style={{ opacity: 0.4 }} />
-                <h4>Inbox Ready</h4>
-                <p>Click on any thread from the list on the left to read messages and reply to customers.</p>
+                <img src="/callfavicon.svg" alt="Call Anexa" style={{ width: '250px', filter: 'brightness(0) invert(1)', opacity: 0.15 }} />
               </div>
             )}
           </div>
@@ -484,7 +661,12 @@ export default function UnifiedInbox({ sessions, socket }) {
                   {/* Contact Avatar + Name */}
                   <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.75rem' }}>
                     <div className="livechat-avatar" style={{ width: '56px', height: '56px', fontSize: '1.1rem' }}>
-                      {(crmDetails.name || crmDetails.phone || '').slice(-4)}
+                      {(() => {
+                        if (crmDetails.avatar_url && crmDetails.avatar_url !== 'none' && crmDetails.avatar_url !== '') {
+                          return <img src={crmDetails.avatar_url} alt="DP" style={{width:'100%', height:'100%', borderRadius:'50%', objectFit:'cover'}} />;
+                        }
+                        return (crmDetails.name || crmDetails.phone || '').slice(-4);
+                      })()}
                     </div>
                     <div style={{ textAlign: 'center' }}>
                       <h4 style={{ color: '#fff', fontSize: '1rem', fontWeight: 700, margin: 0 }}>{crmDetails.name || 'Anonymous User'}</h4>
@@ -511,45 +693,133 @@ export default function UnifiedInbox({ sessions, socket }) {
                     </select>
                   </div>
 
-                  {/* Tags */}
-                  <div>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.78rem', fontWeight: 700, color: 'var(--text-secondary)', marginBottom: '0.5rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-                      <Tag size={13} /> Tags
-                    </label>
+                  {/* Labels (Previously Tags) */}
+                  <div style={{ borderBottom: '1px solid rgba(255,255,255,0.1)', paddingBottom: '1rem', marginBottom: '1rem' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
+                      <h3 style={{ margin: 0, fontSize: '1rem', display: 'flex', alignItems: 'center', gap: '0.25rem', color: '#fff' }}>
+                        Labels <Info size={14} style={{ color: 'var(--text-muted)' }} />
+                      </h3>
+                      <a href="#" onClick={(e) => { e.preventDefault(); setManageLabelsModalOpen(true); }} style={{ color: '#007bff', textDecoration: 'none', fontSize: '0.85rem' }}>Manage labels</a>
+                    </div>
+                    
                     {crmDetails.tags && (
-                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.3rem', marginBottom: '0.5rem' }}>
-                        {crmDetails.tags.split(',').map((t, idx) => (
-                          <span key={idx} className="crm-tag-pill">{t.trim()}</span>
-                        ))}
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.3rem', marginBottom: '0.75rem' }}>
+                        {crmDetails.tags.split(',').map((t, idx) => {
+                          const tag = t.trim();
+                          if (!tag) return null;
+                          return (
+                            <span key={idx} style={{ background: 'rgba(255,255,255,0.1)', padding: '0.2rem 0.5rem', borderRadius: '4px', fontSize: '0.8rem', color: '#fff', display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+                              {tag}
+                              <X size={12} style={{ cursor: 'pointer', opacity: 0.7 }} onClick={async () => {
+                                let arr = crmDetails.tags.split(',').map(x=>x.trim()).filter(Boolean);
+                                arr = arr.filter(x => x !== tag);
+                                const newTags = arr.join(', ');
+                                try {
+                                  await api.post(`/api/contacts/${crmDetails.id}/update`, { tags: newTags });
+                                  setContacts(prev => prev.map(c => c.id === crmDetails.id ? { ...c, tags: newTags } : c));
+                                } catch (err) { console.error(err); }
+                              }} />
+                            </span>
+                          )
+                        })}
                       </div>
                     )}
-                    <input
-                      type="text"
-                      className="crm-tag-input"
-                      placeholder="VIP, Lead, Customer..."
-                      defaultValue={crmDetails.tags || ''}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          handleTagsUpdate(e);
-                          e.target.blur();
-                        }
-                      }}
-                      style={{ width: '100%' }}
-                    />
+                    
+                    <div style={{ position: 'relative' }}>
+                      <input
+                        id="crm-tags-input"
+                        key={`tags-${crmDetails.id}`}
+                        type="text"
+                        placeholder="Add label"
+                        onFocus={() => setShowLabelDropdown(true)}
+                        onBlur={() => setTimeout(() => setShowLabelDropdown(false), 200)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            const val = e.target.value.trim();
+                            if(val) {
+                              let arr = crmDetails.tags ? crmDetails.tags.split(',').map(t=>t.trim()).filter(Boolean) : [];
+                              if(!arr.includes(val)) arr.push(val);
+                              const newTags = arr.join(', ');
+                              api.post(`/api/contacts/${crmDetails.id}/update`, { tags: newTags }).then(() => {
+                                setContacts(prev => prev.map(c => c.id === crmDetails.id ? { ...c, tags: newTags } : c));
+                                e.target.value = '';
+                                setShowLabelDropdown(false);
+                              }).catch(console.error);
+                            }
+                          }
+                        }}
+                        style={{ width: '100%', padding: '0.5rem', marginBottom: '0.75rem', background: 'rgba(0,0,0,0.2)', border: '1px solid rgba(255,255,255,0.1)', color: '#fff', borderRadius: '4px' }}
+                      />
+                      
+                      {showLabelDropdown && (
+                        <div style={{ position: 'absolute', top: '100%', left: 0, width: '100%', background: '#1e1e24', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '4px', zIndex: 100, padding: '0.5rem', boxShadow: '0 4px 15px rgba(0,0,0,0.5)', marginTop: '-0.5rem' }}>
+                          <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '0.5rem' }}>Available labels</div>
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', maxHeight: '150px', overflowY: 'auto' }}>
+                            {customLabels.filter(l => l.session_id === crmDetails.session_id).map(label => (
+                              <label key={label.id} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }} onClick={e => e.stopPropagation()}>
+                                <input 
+                                  type="checkbox" 
+                                  checked={(crmDetails.tags || '').includes(label.name)}
+                                  onChange={async (e) => {
+                                    let currentTags = crmDetails.tags ? crmDetails.tags.split(',').map(t=>t.trim()).filter(Boolean) : [];
+                                    if(e.target.checked) { if(!currentTags.includes(label.name)) currentTags.push(label.name); }
+                                    else { currentTags = currentTags.filter(t => t !== label.name); }
+                                    const newTags = currentTags.join(', ');
+                                    try {
+                                      await api.post(`/api/contacts/${crmDetails.id}/update`, { tags: newTags });
+                                      setContacts(prev => prev.map(c => c.id === crmDetails.id ? { ...c, tags: newTags } : c));
+                                    } catch (err) { console.error(err); }
+                                  }}
+                                />
+                                <span style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+                                  <span style={{ display: 'inline-block', width: '10px', height: '10px', borderRadius: '50%', backgroundColor: label.color || '#888' }}></span>
+                                  <span style={{ color: '#fff', fontSize: '0.85rem' }}>{label.name}</span>
+                                </span>
+                              </label>
+                            ))}
+                            {customLabels.filter(l => l.session_id === crmDetails.session_id).length === 0 && (
+                              <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>No labels created yet.</div>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   </div>
 
                   {/* Notes */}
-                  <div>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.78rem', fontWeight: 700, color: 'var(--text-secondary)', marginBottom: '0.5rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-                      <FileText size={13} /> Notes
-                    </label>
-                    <textarea
-                      className="crm-notes-area"
-                      defaultValue={crmDetails.notes || ''}
-                      placeholder="Add notes about this client..."
-                      onBlur={handleNotesUpdate}
-                      style={{ width: '100%', minHeight: '100px', resize: 'vertical' }}
-                    />
+                  <div style={{ marginBottom: '1rem' }}>
+                    <h3 style={{ margin: '0 0 0.25rem 0', fontSize: '1rem', color: '#fff' }}>Notes</h3>
+                    <p style={{ margin: '0 0 0.75rem 0', fontSize: '0.85rem', color: 'var(--text-muted)' }}>Keep track of important customer interactions.</p>
+                    
+                    {crmDetails.notes && !showNoteEditor && (
+                      <div style={{ marginBottom: '0.75rem', padding: '0.75rem', background: 'rgba(255,255,255,0.05)', borderRadius: '4px', fontSize: '0.85rem', whiteSpace: 'pre-wrap', color: '#ddd' }}>
+                        {crmDetails.notes}
+                      </div>
+                    )}
+
+                    {!showNoteEditor ? (
+                      <button 
+                        onClick={() => setShowNoteEditor(true)}
+                        style={{ border: '1px solid var(--border)', background: 'transparent', color: '#fff', padding: '0.4rem 0.75rem', borderRadius: '4px', display: 'flex', alignItems: 'center', gap: '0.25rem', cursor: 'pointer' }}
+                      >
+                        {crmDetails.notes ? <Edit2 size={16} /> : <Plus size={16} />} {crmDetails.notes ? 'Edit note' : 'Add note'}
+                      </button>
+                    ) : (
+                      <>
+                        <textarea
+                          id="crm-notes-input"
+                          key={`notes-${crmDetails.id}`}
+                          className="crm-notes-area"
+                          defaultValue={crmDetails.notes || ''}
+                          placeholder="Add notes about this client..."
+                          style={{ width: '100%', minHeight: '100px', resize: 'vertical', marginBottom: '0.5rem', padding: '0.5rem', background: 'rgba(0,0,0,0.2)', border: '1px solid rgba(255,255,255,0.1)', color: '#fff', borderRadius: '4px' }}
+                        />
+                        <div style={{ display: 'flex', gap: '0.5rem' }}>
+                          <button onClick={() => { saveNotesBtn(); setShowNoteEditor(false); }} style={{ padding: '0.4rem 0.75rem', fontSize: '0.8rem', flex: 1, background: 'var(--accent)', color: '#000', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>Save note</button>
+                          <button onClick={() => setShowNoteEditor(false)} style={{ padding: '0.4rem 0.75rem', fontSize: '0.8rem', flex: 1, background: 'rgba(255, 255, 255, 0.1)', color: '#fff', border: '1px solid rgba(255, 255, 255, 0.2)', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>Cancel</button>
+                        </div>
+                      </>
+                    )}
                   </div>
 
                   {/* Agent Info */}
@@ -572,7 +842,7 @@ export default function UnifiedInbox({ sessions, socket }) {
                   {/* Last Activity */}
                   {crmDetails.last_message && (
                     <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                      Last Activity: {new Date(crmDetails.last_message).toLocaleString()}
+                      Last Activity: {new Date(crmDetails.last_message).toLocaleString('en-US', { timeZone: 'Asia/Karachi' })}
                     </div>
                   )}
                 </div>
@@ -607,6 +877,156 @@ export default function UnifiedInbox({ sessions, socket }) {
                   </div>
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {manageLabelsModalOpen && (
+        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 }}>
+          <div style={{ background: '#1e1e24', width: '90%', maxWidth: '400px', borderRadius: '8px', display: 'flex', flexDirection: 'column', boxShadow: '0 10px 25px rgba(0,0,0,0.5)', overflow: 'hidden' }}>
+            <div style={{ padding: '1rem', borderBottom: '1px solid rgba(255,255,255,0.1)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h2 style={{ margin: 0, fontSize: '1.1rem', color: '#fff' }}>Manage custom labels</h2>
+              <button onClick={() => setManageLabelsModalOpen(false)} style={{ background: 'transparent', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', display: 'flex', alignItems: 'center' }}><X size={20} /></button>
+            </div>
+            
+            <div style={{ padding: '1rem', flex: 1, overflowY: 'auto' }}>
+              <p style={{ margin: '0 0 1rem 0', fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+                Use labels to help you describe and organize people. Labels can be about anything, such as customer type or previous orders.
+              </p>
+              
+              <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem', alignItems: 'center' }}>
+                <div style={{ position: 'relative' }}>
+                  <button onClick={() => setShowColorPicker(!showColorPicker)} style={{ display: 'flex', alignItems: 'center', gap: '0.25rem', background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', padding: '0.5rem', borderRadius: '4px', cursor: 'pointer' }}>
+                    <div style={{ width: '12px', height: '12px', borderRadius: '50%', backgroundColor: newLabelColor }}></div>
+                    <ChevronDown size={14} color="#fff" />
+                  </button>
+                  {showColorPicker && (
+                    <div style={{ position: 'absolute', top: '100%', left: 0, background: '#2a2a35', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '4px', padding: '0.5rem', display: 'flex', gap: '0.25rem', zIndex: 10, marginTop: '4px' }}>
+                      {labelColors.map(c => (
+                        <div key={c} onClick={() => { setNewLabelColor(c); setShowColorPicker(false); }} style={{ width: '16px', height: '16px', borderRadius: '50%', backgroundColor: c, cursor: 'pointer', border: newLabelColor === c ? '2px solid #fff' : 'none' }}></div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <input 
+                  type="text" 
+                  placeholder="Name a label..." 
+                  value={newLabelName}
+                  onChange={(e) => setNewLabelName(e.target.value)}
+                  style={{ flex: 1, padding: '0.5rem', background: 'rgba(0,0,0,0.2)', border: '1px solid rgba(255,255,255,0.1)', color: '#fff', borderRadius: '4px' }}
+                />
+                <button 
+                  onClick={async () => {
+                    if (!newLabelName.trim() || !selectedSessionId) return;
+                    try {
+                      const res = await api.post('/api/labels/add', { sessionId: selectedSessionId, name: newLabelName.trim(), color: newLabelColor });
+                      setCustomLabels(prev => [...prev, { id: res.data.id, session_id: selectedSessionId, name: res.data.name, color: res.data.color }]);
+                      setNewLabelName('');
+                    } catch (e) { console.error('Failed to add label', e); }
+                  }}
+                  style={{ background: '#3b82f6', color: '#fff', border: 'none', padding: '0.5rem 1rem', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}
+                >
+                  Add label
+                </button>
+              </div>
+
+              <div style={{ position: 'relative', marginBottom: '1rem' }}>
+                <Search size={16} color="var(--text-muted)" style={{ position: 'absolute', left: '0.5rem', top: '50%', transform: 'translateY(-50%)' }} />
+                <input 
+                  type="text" 
+                  placeholder="Search" 
+                  value={labelSearch}
+                  onChange={e => setLabelSearch(e.target.value)}
+                  style={{ width: '100%', padding: '0.5rem 0.5rem 0.5rem 2rem', background: 'rgba(0,0,0,0.2)', border: '1px solid rgba(255,255,255,0.1)', color: '#fff', borderRadius: '4px' }}
+                />
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                {customLabels.filter(l => l.session_id === selectedSessionId && l.name.toLowerCase().includes(labelSearch.toLowerCase())).map(label => (
+                  <div key={label.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.5rem', background: 'rgba(255,255,255,0.02)', borderRadius: '4px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <div style={{ width: '12px', height: '12px', borderRadius: '50%', backgroundColor: label.color || '#888' }}></div>
+                      <span style={{ color: '#fff', fontSize: '0.9rem' }}>{label.name}</span>
+                    </div>
+                    <button 
+                      onClick={async () => {
+                        try {
+                          await api.delete(`/api/labels/${label.id}`);
+                          setCustomLabels(prev => prev.filter(l => l.id !== label.id));
+                        } catch (e) { console.error('Failed to delete label', e); }
+                      }}
+                      style={{ background: 'transparent', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '4px', padding: '0.25rem', color: 'var(--text-muted)', cursor: 'pointer', display: 'flex', alignItems: 'center' }}
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ padding: '1rem', borderTop: '1px solid rgba(255,255,255,0.1)', display: 'flex', justifyContent: 'flex-end' }}>
+              <button onClick={() => setManageLabelsModalOpen(false)} style={{ background: '#fff', color: '#000', border: 'none', padding: '0.4rem 1rem', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>Done</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Save Contact Modal */}
+      {editContactModalOpen && contactToEdit && (
+        <div className="modal-overlay">
+          <div className="modal-content" style={{ maxWidth: '400px' }}>
+            <div className="modal-header">
+              <h2>{contacts.find(c => c.id === contactToEdit.crmId)?.name && contacts.find(c => c.id === contactToEdit.crmId)?.name !== contactToEdit.contact ? 'Edit Contact' : 'Save Contact'}</h2>
+              <button className="close-btn" onClick={() => setEditContactModalOpen(false)}>
+                <X size={20} />
+              </button>
+            </div>
+            <div className="modal-body" style={{ padding: '1.5rem 2rem' }}>
+              <div style={{ marginBottom: '1.5rem' }}>
+                <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '0.5rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                  Contact Name
+                </label>
+                <div style={{ position: 'relative' }}>
+                  <Edit2 size={16} color="var(--text-muted)" style={{ position: 'absolute', left: '1rem', top: '50%', transform: 'translateY(-50%)' }} />
+                  <input 
+                    type="text" 
+                    className="livechat-search-input" 
+                    value={editContactName} 
+                    onChange={(e) => setEditContactName(e.target.value)} 
+                    placeholder="Enter a custom name"
+                    style={{ width: '100%', paddingLeft: '2.5rem', background: 'rgba(0,0,0,0.3)', border: '1px solid rgba(255,255,255,0.15)', height: '44px', fontSize: '0.95rem' }}
+                  />
+                </div>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', marginTop: '2rem' }}>
+                <button 
+                  onClick={() => setEditContactModalOpen(false)}
+                  style={{ padding: '0.6rem 1.25rem', borderRadius: '6px', fontSize: '0.88rem', fontWeight: 600, background: 'rgba(255,255,255,0.05)', color: '#fff', border: '1px solid rgba(255,255,255,0.1)', cursor: 'pointer', transition: 'all 0.2s' }}
+                >
+                  Cancel
+                </button>
+                <button 
+                  onClick={async () => {
+                    if (!editContactName.trim()) return;
+                    try {
+                      if (contactToEdit.crmId) {
+                        await api.post(`/api/contacts/${contactToEdit.crmId}/update`, { name: editContactName });
+                        setContacts(prev => prev.map(c => c.id === contactToEdit.crmId ? { ...c, name: editContactName } : c));
+                        setAllChats(prev => prev.map(ch => (ch.sessionId === contactToEdit.sessionId && ch.contact === contactToEdit.contact) ? { ...ch, contact_name: editContactName } : ch));
+                      } else {
+                        alert('Contact CRM ID not found. Please wait or send a message first.');
+                      }
+                      setEditContactModalOpen(false);
+                    } catch (err) {
+                      alert('Failed to save contact name');
+                    }
+                  }}
+                  style={{ padding: '0.6rem 1.5rem', borderRadius: '6px', fontSize: '0.88rem', fontWeight: 600, background: 'linear-gradient(135deg, #d4a017 0%, #9c7611 100%)', color: '#000', border: 'none', cursor: 'pointer', boxShadow: '0 4px 15px rgba(212, 160, 23, 0.25)' }}
+                >
+                  Save Changes
+                </button>
+              </div>
             </div>
           </div>
         </div>

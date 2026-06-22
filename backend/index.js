@@ -12,6 +12,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const multer = require('multer');
+const cheerio = require('cheerio');
 
 const JWT_SECRET = 'super-secret-multi-whatsapp-key-123';
 
@@ -58,6 +59,7 @@ db.exec(`
     allowPrivate INTEGER DEFAULT 1,
     aiMaxContext INTEGER DEFAULT 10,
     aiCustomUrl TEXT DEFAULT '',
+    learningUrl TEXT DEFAULT '',
     FOREIGN KEY(user_id) REFERENCES users(id)
   );
 
@@ -134,9 +136,12 @@ try { db.exec("ALTER TABLE sessions ADD COLUMN allowGroups INTEGER DEFAULT 0"); 
 try { db.exec("ALTER TABLE sessions ADD COLUMN allowPrivate INTEGER DEFAULT 1"); } catch(e){}
 try { db.exec("ALTER TABLE sessions ADD COLUMN aiMaxContext INTEGER DEFAULT 10"); } catch(e){}
 try { db.exec("ALTER TABLE sessions ADD COLUMN aiCustomUrl TEXT DEFAULT ''"); } catch(e){}
+try { db.exec("ALTER TABLE sessions ADD COLUMN learningUrl TEXT DEFAULT ''"); } catch(e){}
 try { db.exec("ALTER TABLE users ADD COLUMN maxAgents INTEGER DEFAULT 1"); } catch(e){}
 // Give admin unlimited agents
 try { db.exec("UPDATE users SET maxAgents = -1 WHERE role = 'admin'"); } catch(e){}
+// Custom labels table
+try { db.exec("CREATE TABLE IF NOT EXISTS custom_labels (id TEXT PRIMARY KEY, session_id TEXT, name TEXT, color TEXT)"); } catch(e){}
 // WhatsApp profile info columns
 try { db.exec("ALTER TABLE sessions ADD COLUMN whatsappName TEXT DEFAULT ''"); } catch(e){}
 try { db.exec("ALTER TABLE sessions ADD COLUMN whatsappAvatar TEXT DEFAULT ''"); } catch(e){}
@@ -145,6 +150,7 @@ try { db.exec("ALTER TABLE reply_rules ADD COLUMN is_exact INTEGER DEFAULT 0"); 
 try { db.exec("ALTER TABLE reply_rules ADD COLUMN media_url TEXT DEFAULT ''"); } catch(e){}
 // Contacts migrations
 try { db.exec("ALTER TABLE contacts ADD COLUMN lead_stage TEXT DEFAULT 'new'"); } catch(e){}
+try { db.exec("ALTER TABLE contacts ADD COLUMN avatar_url TEXT DEFAULT ''"); } catch(e){}
 
 // Auto-promote first user or username 'admin' to admin
 try {
@@ -195,13 +201,21 @@ const generateAIResponse = async (sessionId, contact, userMessage) => {
     }
 
     try {
-        if (sessionRow.aiProvider === 'openai' || sessionRow.aiProvider === 'deepseek') {
+        if (['openai', 'deepseek', 'groq', 'together', 'xai', 'openrouter'].includes(sessionRow.aiProvider)) {
             let url = 'https://api.openai.com/v1/chat/completions';
             let modelName = sessionRow.aiModel || 'gpt-3.5-turbo';
 
             if (sessionRow.aiProvider === 'deepseek') {
                 url = 'https://api.deepseek.com/v1/chat/completions';
                 modelName = sessionRow.aiModel || 'deepseek-chat';
+            } else if (sessionRow.aiProvider === 'groq') {
+                url = 'https://api.groq.com/openai/v1/chat/completions';
+            } else if (sessionRow.aiProvider === 'together') {
+                url = 'https://api.together.xyz/v1/chat/completions';
+            } else if (sessionRow.aiProvider === 'xai') {
+                url = 'https://api.x.ai/v1/chat/completions';
+            } else if (sessionRow.aiProvider === 'openrouter') {
+                url = 'https://openrouter.ai/api/v1/chat/completions';
             }
 
             if (sessionRow.aiCustomUrl) {
@@ -273,6 +287,27 @@ const generateAIResponse = async (sessionId, contact, userMessage) => {
     return null;
 };
 
+// Helper to normalize phone numbers using Baileys onWhatsApp query
+const normalizeJid = async (sock, contact) => {
+    if (!contact) return contact;
+    let phone = contact.trim();
+    if (phone.includes('@g.us') || phone.includes('@newsletter') || phone === 'status@broadcast') return phone;
+    
+    // Ignore if it's already an @lid
+    if (phone.includes('@lid')) return phone;
+    
+    phone = phone.replace(/[\+\-\(\)\s]/g, '');
+    
+    // Auto-correct Pakistani local numbers (03xx -> 923xx)
+    if (phone.startsWith('03') && phone.length === 11) {
+        phone = '92' + phone.substring(1);
+    }
+    
+    if (!phone.includes('@')) phone += '@s.whatsapp.net';
+    
+    return phone;
+};
+
 // Keyword Rules Matcher
 const matchKeywordRules = (sessionId, textMessage) => {
     try {
@@ -301,18 +336,29 @@ setInterval(async () => {
         const client = clients[msg.session_id];
         if (client && client.sock && client.status === 'ready') {
             try {
-                const sentMsg = await client.sock.sendMessage(msg.contact, { text: msg.message });
+                const normalizedContact = await normalizeJid(client.sock, msg.contact);
+                const sentMsg = await client.sock.sendMessage(normalizedContact, { text: msg.message });
                 db.prepare('UPDATE scheduled_messages SET status = ? WHERE id = ?').run('sent', msg.id);
-                console.log(`[Scheduler] ✅ Sent scheduled message ${msg.id} to ${msg.contact}`);
+                console.log(`[Scheduler] ✅ Sent scheduled message ${msg.id} to ${msg.contact} (${normalizedContact})`);
                 io.emit('scheduled_update', { id: msg.id, sessionId: msg.session_id, status: 'sent' });
 
                 // Also save in messages table for chat history
                 const msgId = sentMsg?.key?.id || `msg-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
                 try {
                     db.prepare('INSERT INTO messages (id, session_id, contact, message_text, direction, timestamp) VALUES (?, ?, ?, ?, ?, ?)').run(
-                        msgId, msg.session_id, msg.contact, msg.message, 'outgoing', Date.now()
+                        msgId, msg.session_id, normalizedContact, msg.message, 'outgoing', Date.now()
                     );
                 } catch(e) {}
+
+                // Update contact ALWAYS
+                const contactExists = db.prepare('SELECT * FROM contacts WHERE session_id = ? AND phone = ?').get(msg.session_id, normalizedContact);
+                if (!contactExists) {
+                    db.prepare('INSERT INTO contacts (id, session_id, phone, name, last_message) VALUES (?, ?, ?, ?, ?)').run(
+                        `contact-${Date.now()}`, msg.session_id, normalizedContact, normalizedContact, Date.now()
+                    );
+                } else {
+                    db.prepare('UPDATE contacts SET last_message = ? WHERE session_id = ? AND phone = ?').run(Date.now(), msg.session_id, normalizedContact);
+                }
 
                 // Small delay between sends to avoid ban
                 await new Promise(resolve => setTimeout(resolve, 2000));
@@ -421,7 +467,25 @@ const initSession = async (sessionId) => {
         const msg = m.messages[0];
         if (!msg.message) return; // Process both incoming and outgoing
         
-        const contact = msg.key.remoteJid;
+        let contact = msg.key.remoteJid;
+
+        // Resolve @lid to real phone number for incoming messages
+        if (contact.endsWith('@lid')) {
+            const lidId = contact.split('@')[0];
+            const authFolder = path.join(__dirname, 'baileys_auth', sessionId);
+            const mappingFile = path.join(authFolder, `lid-mapping-${lidId}_reverse.json`);
+            try {
+                if (fs.existsSync(mappingFile)) {
+                    const realPhone = JSON.parse(fs.readFileSync(mappingFile, 'utf8'));
+                    if (realPhone) {
+                        contact = `${realPhone}@s.whatsapp.net`;
+                        msg.key.remoteJid = contact; // Override for subsequent logic
+                    }
+                }
+            } catch (e) {
+                console.error('Failed to resolve lid mapping', e);
+            }
+        }
 
         // IGNORE GROUPS, CHANNELS, AND STATUSES
         if (contact.endsWith('@g.us') || contact.endsWith('@newsletter') || contact === 'status@broadcast') {
@@ -501,6 +565,7 @@ const initSession = async (sessionId) => {
         io.emit('new_message', {
             sessionId,
             contact,
+            contact_name: (!msg.key.fromMe && msg.pushName) ? msg.pushName : contact,
             message: {
                 id: msgId,
                 message_text: textMessage,
@@ -509,27 +574,43 @@ const initSession = async (sessionId) => {
             }
         });
 
+        // Update contact ALWAYS (so outgoing messages or messages while paused still save contact to CRM)
+        const contactExists = db.prepare('SELECT * FROM contacts WHERE session_id = ? AND phone = ?').get(sessionId, contact);
+        if (!contactExists) {
+            const initialName = (!msg.key.fromMe && msg.pushName) ? msg.pushName : contact;
+            db.prepare('INSERT INTO contacts (id, session_id, phone, name, last_message) VALUES (?, ?, ?, ?, ?)').run(
+                `contact-${Date.now()}`, sessionId, contact, initialName, Date.now()
+            );
+        } else {
+            if (!msg.key.fromMe && msg.pushName) {
+                db.prepare('UPDATE contacts SET last_message = ?, name = ? WHERE session_id = ? AND phone = ?').run(Date.now(), msg.pushName, sessionId, contact);
+            } else {
+                db.prepare('UPDATE contacts SET last_message = ? WHERE session_id = ? AND phone = ?').run(Date.now(), sessionId, contact);
+            }
+        }
+
+        // Fetch DP in background
+        if (!contactExists || !contactExists.avatar_url || contactExists.avatar_url === '') {
+            sock.profilePictureUrl(contact, 'image').then(url => {
+                if (url) {
+                    db.prepare('UPDATE contacts SET avatar_url = ? WHERE session_id = ? AND phone = ?').run(url, sessionId, contact);
+                    io.emit('contact_updated', { sessionId, contact, avatar_url: url });
+                }
+            }).catch(() => {
+                db.prepare('UPDATE contacts SET avatar_url = ? WHERE session_id = ? AND phone = ?').run('none', sessionId, contact);
+            });
+        }
+
+        // Save analytics ALWAYS
+        db.prepare('INSERT INTO message_analytics (session_id, contact, message_type, timestamp, direction) VALUES (?, ?, ?, ?, ?)').run(
+            sessionId, contact, 'text', Date.now(), direction
+        );
+
         // Skip auto-responses if the message was sent by us (fromMe) or if agent is paused
         if (msg.key.fromMe || !currentConfig.isActive) return;
 
         // Group & Private Chat filters
-        if (isGroup && !currentConfig.allowGroups) return;
-        if (!isGroup && !currentConfig.allowPrivate) return;
-
-        // Save analytics
-        db.prepare('INSERT INTO message_analytics (session_id, contact, message_type, timestamp, direction) VALUES (?, ?, ?, ?, ?)').run(
-            sessionId, contact, 'text', Date.now(), 'incoming'
-        );
-
-        // Update contact
-        const contactExists = db.prepare('SELECT * FROM contacts WHERE session_id = ? AND phone = ?').get(sessionId, contact);
-        if (!contactExists) {
-            db.prepare('INSERT INTO contacts (id, session_id, phone, name, last_message) VALUES (?, ?, ?, ?, ?)').run(
-                `contact-${Date.now()}`, sessionId, contact, contact, Date.now()
-            );
-        } else {
-            db.prepare('UPDATE contacts SET last_message = ? WHERE session_id = ? AND phone = ?').run(Date.now(), sessionId, contact);
-        }
+        if (isGroup) return;
 
         db.prepare('UPDATE sessions SET msgCount = msgCount + 1 WHERE id = ?').run(sessionId);
         const newCount = currentConfig.msgCount + 1;
@@ -755,7 +836,7 @@ app.post('/api/sessions/:id/update', authenticateToken, (req, res) => {
     if (!hasAccess(req, id)) return res.status(403).json({ error: 'Unauthorized' });
     if (req.user.role === 'viewer') return res.status(403).json({ error: 'Permission denied (Viewer mode)' });
 
-    const { name, prompt, isActive, replyDelay, aiEnabled, aiProvider, aiApiKey, aiModel, allowGroups, allowPrivate, aiMaxContext, aiCustomUrl } = req.body;
+    const { name, prompt, isActive, replyDelay, aiEnabled, aiProvider, aiApiKey, aiModel, allowGroups, allowPrivate, aiMaxContext, aiCustomUrl, learningUrl } = req.body;
     
     if (aiEnabled && req.user.role !== 'admin' && !req.user.canUseAI) {
         return res.status(403).json({ error: 'Permission denied (AI usage not allowed)' });
@@ -775,6 +856,7 @@ app.post('/api/sessions/:id/update', authenticateToken, (req, res) => {
     if (allowPrivate !== undefined) { fields.push('allowPrivate = ?'); values.push(allowPrivate ? 1 : 0); }
     if (aiMaxContext !== undefined) { fields.push('aiMaxContext = ?'); values.push(Number(aiMaxContext)); }
     if (aiCustomUrl !== undefined) { fields.push('aiCustomUrl = ?'); values.push(aiCustomUrl); }
+    if (learningUrl !== undefined) { fields.push('learningUrl = ?'); values.push(learningUrl); }
     
     if (fields.length > 0) {
         values.push(id);
@@ -788,6 +870,181 @@ app.post('/api/sessions/:id/update', authenticateToken, (req, res) => {
         res.json({ success: true, session: updated });
     } else {
         res.json({ success: true });
+    }
+});
+
+app.post('/api/sessions/:id/validate-ai', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    if (!hasAccess(req, id)) return res.status(403).json({ error: 'Unauthorized' });
+
+    const { aiProvider, aiApiKey, aiModel, aiCustomUrl } = req.body;
+    if (!aiProvider || aiProvider === 'none') return res.json({ success: true });
+    
+    try {
+        let url = 'https://api.openai.com/v1/chat/completions';
+        let modelName = aiModel || 'gpt-3.5-turbo';
+
+        if (aiProvider === 'deepseek') {
+            url = 'https://api.deepseek.com/v1/chat/completions';
+            modelName = aiModel || 'deepseek-chat';
+        } else if (aiProvider === 'groq') {
+            url = 'https://api.groq.com/openai/v1/chat/completions';
+        } else if (aiProvider === 'together') {
+            url = 'https://api.together.xyz/v1/chat/completions';
+        } else if (aiProvider === 'xai') {
+            url = 'https://api.x.ai/v1/chat/completions';
+        } else if (aiProvider === 'openrouter') {
+            url = 'https://openrouter.ai/api/v1/chat/completions';
+        }
+
+        if (aiCustomUrl) {
+            url = aiCustomUrl;
+        }
+
+        const headers = { 'Content-Type': 'application/json' };
+        if (aiApiKey) {
+            headers['Authorization'] = `Bearer ${aiApiKey}`;
+        } else {
+            return res.status(400).json({ error: 'API Key is missing.' });
+        }
+
+        // Test with a lightweight message
+        const response = await fetch(url, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                model: modelName,
+                messages: [{ role: 'user', content: 'Hi' }],
+                max_tokens: 5
+            })
+        });
+
+        if (!response.ok) {
+            const errData = await response.text();
+            console.error('AI Validation failed:', errData);
+            return res.status(400).json({ error: `Credential not valid or API error: ${response.statusText}` });
+        }
+
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('Error validating AI key:', err);
+        return res.status(500).json({ error: 'Network error or unable to reach AI provider.' });
+    }
+});
+
+app.post('/api/sessions/:id/train-website', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    if (!hasAccess(req, id)) return res.status(403).json({ error: 'Unauthorized' });
+
+    const { url } = req.body;
+    if (!url) return res.status(400).json({ error: 'URL is required.' });
+
+    const sessionRow = db.prepare('SELECT * FROM sessions WHERE id = ?').get(id);
+    if (!sessionRow || !sessionRow.aiApiKey || sessionRow.aiProvider === 'none') {
+        return res.status(400).json({ error: 'Please configure and save an AI Provider and API Key first.' });
+    }
+
+    try {
+        // Use Jina AI Reader to extract content from potentially JavaScript-heavy websites
+        const jinaUrl = `https://r.jina.ai/${url}`;
+        const response = await fetch(jinaUrl, { 
+            headers: { 
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            } 
+        });
+        
+        if (!response.ok) {
+            return res.status(400).json({ error: `Failed to fetch website: ${response.statusText}` });
+        }
+        
+        let textContent = await response.text();
+        
+        // Remove markdown images and links if necessary to save tokens
+        textContent = textContent.replace(/!\[.*?\]\(.*?\)/g, '').replace(/\[(.*?)\]\(.*?\)/g, '$1');
+
+        // Limit length to avoid token limit errors
+        textContent = textContent.substring(0, 15000).trim();
+
+        if (!textContent || textContent.length < 50) {
+            return res.status(400).json({ error: 'Could not extract useful text from the website.' });
+        }
+
+        // Ask AI to generate a prompt
+        const aiPrompt = `You are an expert AI configuration assistant. I am building a customer support bot for a business.
+Read the following scraped website data and create a highly detailed "System Prompt" that tells the bot how to behave, what products/services to talk about, and what tone to use. 
+Return ONLY the final system prompt string, nothing else. No markdown formatting around the output, just the raw text.
+
+WEBSITE DATA:
+${textContent}`;
+
+        // Prepare AI request
+        let apiUrl = 'https://api.openai.com/v1/chat/completions';
+        let modelName = sessionRow.aiModel || 'gpt-3.5-turbo';
+
+        if (sessionRow.aiProvider === 'deepseek') {
+            apiUrl = 'https://api.deepseek.com/v1/chat/completions';
+            modelName = sessionRow.aiModel || 'deepseek-chat';
+        } else if (sessionRow.aiProvider === 'groq') {
+            apiUrl = 'https://api.groq.com/openai/v1/chat/completions';
+        } else if (sessionRow.aiProvider === 'together') {
+            apiUrl = 'https://api.together.xyz/v1/chat/completions';
+        } else if (sessionRow.aiProvider === 'xai') {
+            apiUrl = 'https://api.x.ai/v1/chat/completions';
+        } else if (sessionRow.aiProvider === 'openrouter') {
+            apiUrl = 'https://openrouter.ai/api/v1/chat/completions';
+        }
+
+        if (sessionRow.aiCustomUrl) apiUrl = sessionRow.aiCustomUrl;
+
+        const headers = { 
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${sessionRow.aiApiKey}`
+        };
+
+        const aiResponse = await fetch(apiUrl, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                model: modelName,
+                messages: [{ role: 'user', content: aiPrompt }],
+                max_tokens: 1500,
+                temperature: 0.7
+            })
+        });
+
+        if (!aiResponse.ok) {
+            const errData = await aiResponse.text();
+            console.error('AI Training Generation failed:', errData);
+            return res.status(400).json({ error: 'AI failed to generate prompt. Please check your AI API key and limits.' });
+        }
+
+        const data = await aiResponse.json();
+        let generatedPrompt = data.choices?.[0]?.message?.content || null;
+
+        if (!generatedPrompt) {
+            return res.status(400).json({ error: 'AI returned an empty response.' });
+        }
+
+        // Clean up markdown block if the AI returned it despite instructions
+        generatedPrompt = generatedPrompt.replace(/^```[\w]*\n/, '').replace(/```$/, '').trim();
+
+        // Save learningUrl to SQLite database
+        db.prepare('UPDATE sessions SET learningUrl = ? WHERE id = ?').run(url, id);
+
+        // Fetch updated session and emit socket update
+        const updated = db.prepare('SELECT * FROM sessions WHERE id = ?').get(id);
+        if (updated) {
+            updated.isActive = !!updated.isActive;
+            updated.aiEnabled = !!updated.aiEnabled;
+            updated.allowGroups = !!updated.allowGroups;
+            updated.allowPrivate = !!updated.allowPrivate;
+            io.emit('update_session', { sessionId: id, data: updated });
+        }
+
+        res.json({ success: true, generatedPrompt });
+    } catch (err) {
+        console.error('Error training on website:', err);
+        res.status(500).json({ error: 'Server error while fetching or parsing the website.' });
     }
 });
 
@@ -837,14 +1094,7 @@ app.get('/api/analytics/:sessionId', authenticateToken, (req, res) => {
     const incoming = db.prepare('SELECT COUNT(*) as count FROM message_analytics WHERE session_id = ? AND direction = ?').get(sessionId, 'incoming');
     const outgoing = db.prepare('SELECT COUNT(*) as count FROM message_analytics WHERE session_id = ? AND direction = ?').get(sessionId, 'outgoing');
     
-    const topContacts = db.prepare(`
-        SELECT contact, COUNT(*) as count 
-        FROM message_analytics 
-        WHERE session_id = ? 
-        GROUP BY contact 
-        ORDER BY count DESC 
-        LIMIT 10
-    `).all(sessionId);
+
 
     const last24h = db.prepare('SELECT COUNT(*) as count FROM message_analytics WHERE session_id = ? AND timestamp > ?').get(sessionId, Date.now() - 86400000);
     const last7days = db.prepare('SELECT COUNT(*) as count FROM message_analytics WHERE session_id = ? AND timestamp > ?').get(sessionId, Date.now() - 604800000);
@@ -871,7 +1121,7 @@ app.get('/api/analytics/:sessionId', authenticateToken, (req, res) => {
         total: total.count,
         incoming: incoming.count,
         outgoing: outgoing.count,
-        topContacts,
+
         last24h: last24h.count,
         last7days: last7days.count,
         dailyStats
@@ -885,6 +1135,24 @@ app.get('/api/contacts/:sessionId', authenticateToken, (req, res) => {
 
     try {
         const contacts = db.prepare('SELECT * FROM contacts WHERE session_id = ? ORDER BY last_message DESC').all(sessionId);
+        
+        // Auto-fetch missing DPs in background
+        const client = clients[sessionId];
+        if (client && client.sock) {
+            contacts.forEach(c => {
+                if (!c.avatar_url || c.avatar_url === '') {
+                    client.sock.profilePictureUrl(c.phone, 'image').then(url => {
+                        if (url) {
+                            db.prepare('UPDATE contacts SET avatar_url = ? WHERE session_id = ? AND phone = ?').run(url, sessionId, c.phone);
+                            io.emit('contact_updated', { sessionId, contact: c.phone, avatar_url: url });
+                        }
+                    }).catch(() => {
+                        db.prepare('UPDATE contacts SET avatar_url = ? WHERE session_id = ? AND phone = ?').run('none', sessionId, c.phone);
+                    });
+                }
+            });
+        }
+
         res.json(contacts);
     } catch (e) {
         console.error('Error fetching contacts:', e);
@@ -916,6 +1184,49 @@ app.post('/api/contacts/:id/update', authenticateToken, (req, res) => {
     } catch (e) {
         console.error('Error updating contact:', e);
         res.status(500).json({ error: 'Failed to update contact' });
+    }
+});
+
+// --- CUSTOM LABELS ROUTES ---
+app.get('/api/labels/:sessionId', authenticateToken, (req, res) => {
+    const { sessionId } = req.params;
+    if (!hasAccess(req, sessionId)) return res.status(403).json({ error: 'Unauthorized' });
+
+    try {
+        const labels = db.prepare('SELECT * FROM custom_labels WHERE session_id = ?').all(sessionId);
+        res.json(labels);
+    } catch (e) {
+        console.error('Error fetching labels:', e);
+        res.status(500).json({ error: 'Failed to fetch labels' });
+    }
+});
+
+app.post('/api/labels/add', authenticateToken, (req, res) => {
+    const { sessionId, name, color } = req.body;
+    if (!hasAccess(req, sessionId)) return res.status(403).json({ error: 'Unauthorized' });
+
+    try {
+        const id = 'lbl-' + Date.now();
+        db.prepare('INSERT INTO custom_labels (id, session_id, name, color) VALUES (?, ?, ?, ?)').run(id, sessionId, name, color);
+        res.json({ success: true, id, name, color });
+    } catch (e) {
+        console.error('Error adding label:', e);
+        res.status(500).json({ error: 'Failed to add label' });
+    }
+});
+
+app.delete('/api/labels/:id', authenticateToken, (req, res) => {
+    const { id } = req.params;
+    try {
+        const label = db.prepare('SELECT session_id FROM custom_labels WHERE id = ?').get(id);
+        if (!label) return res.status(404).json({ error: 'Label not found' });
+        if (!hasAccess(req, label.session_id)) return res.status(403).json({ error: 'Unauthorized' });
+
+        db.prepare('DELETE FROM custom_labels WHERE id = ?').run(id);
+        res.json({ success: true });
+    } catch (e) {
+        console.error('Error deleting label:', e);
+        res.status(500).json({ error: 'Failed to delete label' });
     }
 });
 
@@ -1064,14 +1375,16 @@ app.get('/api/chats/:sessionId', authenticateToken, (req, res) => {
     // Fetch unique contacts who have messages, along with their last message and timestamp
     const chats = db.prepare(`
         SELECT contact, max(timestamp) as last_msg_time, 
+        (SELECT name FROM contacts WHERE session_id = ? AND phone = m.contact LIMIT 1) as contact_name,
+        (SELECT avatar_url FROM contacts WHERE session_id = ? AND phone = m.contact LIMIT 1) as avatar_url,
         (SELECT message_text FROM messages WHERE session_id = ? AND contact = m.contact ORDER BY timestamp DESC LIMIT 1) as last_message,
         (SELECT direction FROM messages WHERE session_id = ? AND contact = m.contact ORDER BY timestamp DESC LIMIT 1) as last_direction,
         (SELECT COUNT(*) FROM messages WHERE session_id = ? AND contact = m.contact AND direction = 'incoming' AND is_read = 0) as unread_count
         FROM messages m
-        WHERE session_id = ?
+        WHERE session_id = ? AND contact != 'sandbox-contact'
         GROUP BY contact
         ORDER BY last_msg_time DESC
-    `).all(sessionId, sessionId, sessionId, sessionId);
+    `).all(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId);
 
     res.json(chats);
 });
@@ -1095,6 +1408,20 @@ app.post('/api/chats/:sessionId/:contact/read', authenticateToken, (req, res) =>
     res.json({ success: true });
 });
 
+app.delete('/api/chats/:sessionId/:contact', authenticateToken, (req, res) => {
+    const { sessionId, contact } = req.params;
+    if (!hasAccess(req, sessionId)) return res.status(403).json({ error: 'Unauthorized' });
+    if (req.user.role === 'viewer') return res.status(403).json({ error: 'Permission denied (Viewer mode)' });
+
+    try {
+        db.prepare('DELETE FROM messages WHERE session_id = ? AND contact = ?').run(sessionId, contact);
+        res.json({ success: true, message: 'Chat deleted' });
+    } catch (e) {
+        console.error('Error deleting chat:', e);
+        res.status(500).json({ error: 'Failed to delete chat' });
+    }
+});
+
 app.post('/api/chats/send', authenticateToken, async (req, res) => {
     const { sessionId, contact, message, mediaUrl, buttons, isBulk } = req.body;
     if (!sessionId || !contact || (!message && !mediaUrl)) return res.status(400).json({ error: 'Parameters missing' });
@@ -1113,8 +1440,7 @@ app.post('/api/chats/send', authenticateToken, async (req, res) => {
     }
 
     try {
-        let phone = contact.trim();
-        if (!phone.includes('@')) phone += '@s.whatsapp.net';
+        let phone = await normalizeJid(client.sock, contact);
 
         // Send through socket
         let sentMsg;
@@ -1244,8 +1570,7 @@ app.post('/api/chats/send-media', authenticateToken, upload.single('file'), asyn
     }
 
     try {
-        let phone = contact.trim();
-        if (!phone.includes('@')) phone += '@s.whatsapp.net';
+        let phone = await normalizeJid(client.sock, contact);
 
         const fileBuffer = fs.readFileSync(req.file.path);
         const mimeType = req.file.mimetype;

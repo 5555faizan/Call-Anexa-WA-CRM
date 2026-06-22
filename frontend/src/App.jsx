@@ -146,6 +146,38 @@ function App() {
   const [sandboxMessages, setSandboxMessages] = useState([]);
   const [sandboxInput, setSandboxInput] = useState('');
   const [sandboxTyping, setSandboxTyping] = useState(false);
+  const [popupSandboxSession, setPopupSandboxSession] = useState(null);
+  const [livePreviewError, setLivePreviewError] = useState(null);
+  const [autoReplyError, setAutoReplyError] = useState(null);
+  const [learningUrls, setLearningUrls] = useState({});
+  const [isTraining, setIsTraining] = useState({});
+  const [aiDrafts, setAiDrafts] = useState({});
+  const [promptSaveStatus, setPromptSaveStatus] = useState({});
+
+  const getDraftValue = (sessionId, key, defaultValue = '') => {
+    if (aiDrafts[sessionId] && aiDrafts[sessionId][key] !== undefined) {
+      return aiDrafts[sessionId][key];
+    }
+    const session = sessions.find(s => s.id === sessionId);
+    return session ? session[key] : defaultValue;
+  };
+
+  const setDraftValue = (sessionId, updates) => {
+    setAiDrafts(prev => ({
+      ...prev,
+      [sessionId]: {
+        ...(prev[sessionId] || {
+          aiProvider: sessions.find(s => s.id === sessionId)?.aiProvider || 'none',
+          aiApiKey: sessions.find(s => s.id === sessionId)?.aiApiKey || '',
+          aiModel: sessions.find(s => s.id === sessionId)?.aiModel || '',
+          aiCustomUrl: sessions.find(s => s.id === sessionId)?.aiCustomUrl || '',
+          aiMaxContext: sessions.find(s => s.id === sessionId)?.aiMaxContext !== undefined ? sessions.find(s => s.id === sessionId).aiMaxContext : 10,
+        }),
+        ...updates
+      }
+    }));
+  };
+
   const chatScrollerRef = useRef(null);
 
   // Live Chat CRM states
@@ -195,8 +227,10 @@ function App() {
   // Refs for socket subscription callbacks to avoid closure traps
   const selectedAgentRef = useRef(livechatSelectedAgent);
   const selectedContactRef = useRef(livechatSelectedContact);
+  const promptSaveStatusRef = useRef(promptSaveStatus);
   useEffect(() => { selectedAgentRef.current = livechatSelectedAgent; }, [livechatSelectedAgent]);
   useEffect(() => { selectedContactRef.current = livechatSelectedContact; }, [livechatSelectedContact]);
+  useEffect(() => { promptSaveStatusRef.current = promptSaveStatus; }, [promptSaveStatus]);
 
   useEffect(() => {
     if (token && role !== 'viewer') {
@@ -219,7 +253,17 @@ function App() {
       });
 
       socket.on('update_session', (data) => {
-        setSessions(prev => prev.map(s => s.id === data.sessionId ? { ...s, ...data.data } : s));
+        setSessions(prev => prev.map(s => {
+          if (s.id === data.sessionId) {
+            const isDirty = promptSaveStatusRef.current[s.id] === 'dirty';
+            const merged = { ...s, ...data.data };
+            if (isDirty) {
+              merged.prompt = s.prompt; // Keep local dirty prompt from being overwritten
+            }
+            return merged;
+          }
+          return s;
+        }));
       });
 
       socket.on('new_session', (data) => {
@@ -344,6 +388,14 @@ function App() {
     try {
       const res = await api.get('/api/sessions');
       setSessions(res.data);
+      // Initialize learningUrls map from loaded sessions
+      const urls = {};
+      res.data.forEach(s => {
+        if (s.learningUrl) {
+          urls[s.id] = s.learningUrl;
+        }
+      });
+      setLearningUrls(prev => ({ ...prev, ...urls }));
     } catch (err) {
       if (err.response?.status === 401 || err.response?.status === 403) {
         handleLogout();
@@ -1313,6 +1365,14 @@ function App() {
             <span>Inbox</span>
           </button>
 
+          <button
+            className={`menu-item ${activeTab === 'whatsapp-templates' ? 'active' : ''}`}
+            onClick={() => setActiveTab('whatsapp-templates')}
+          >
+            <FileText size={18} className="menu-item-icon" />
+            <span>WA Templates</span>
+          </button>
+
           {/* <button
             className={`menu-item ${activeTab === 'rules' ? 'active' : ''}`}
             onClick={() => setActiveTab('rules')}
@@ -1445,6 +1505,9 @@ function App() {
                   placeholder="Search agents by name or id..."
                   value={searchQuery}
                   onChange={(e) => { setSearchQuery(e.target.value); setCurrentPage(1); }}
+                  autoComplete="off"
+                  name="agent-search-random-name"
+                  data-lpignore="true"
                 />
               </div>
             </div>
@@ -1511,15 +1574,40 @@ function App() {
                         </div>
                       </div>
 
-                      <div className={`status-pill-badge ${session.status}`}>
-                        <span className="pulse-dot"></span>
-                        {session.status === 'authenticated' || session.status === 'ready' ? 'Connected' :
-                          session.status === 'qr' ? 'Pending Scan' : 'Waking up'}
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '0.4rem' }}>
+                        <div className={`status-pill-badge ${session.status}`}>
+                          <span className="pulse-dot"></span>
+                          {session.status === 'authenticated' || session.status === 'ready' ? 'Connected' :
+                            session.status === 'qr' ? 'Pending Scan' : 'Waking up'}
+                        </div>
+                        {(() => {
+                          const savedProvider = session.aiProvider;
+                          const savedApiKey = session.aiApiKey;
+                          const draftProvider = getDraftValue(session.id, 'aiProvider', 'none');
+                          const draftApiKey = getDraftValue(session.id, 'aiApiKey', '');
+                          
+                          const hasValidSavedAi = session.aiEnabled && savedProvider && savedProvider !== 'none' && savedApiKey;
+                          const isEditingAiConfig = draftProvider !== savedProvider || draftApiKey !== savedApiKey;
+                          const showAiBadge = hasValidSavedAi && !isEditingAiConfig;
+                          const isPromptSaved = promptSaveStatus[session.id] === 'saved' || (!promptSaveStatus[session.id] && session.prompt);
+                          
+                          if (!showAiBadge) return null;
+                          return (
+                            <div className="indicator-ai-badge" style={{ position: 'relative', top: 'auto', right: 'auto', margin: 0, zIndex: 10, display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
+                              <Zap size={10} className={session.isActive ? "zap-blink" : ""} /> AI: {savedProvider.toUpperCase()}
+                            </div>
+                          );
+                        })()}
                       </div>
                     </div>
 
                     <div className="card-options-list">
-                      <div className="option-row">
+                      <div className="option-row" style={{ position: 'relative' }}>
+                        {autoReplyError === session.id && (
+                          <div style={{ position: 'absolute', top: '-18px', right: 0, color: '#ef4444', fontSize: '0.75rem', fontWeight: 'bold' }}>
+                            System prompt must be saved!
+                          </div>
+                        )}
                         <div className="option-title">
                           <Activity size={14} className="cyber-green" />
                           <span>Auto-Reply Active</span>
@@ -1528,41 +1616,20 @@ function App() {
                           <input
                             type="checkbox"
                             checked={!!session.isActive}
-                            onChange={(e) => handleUpdate(session.id, { isActive: e.target.checked })}
+                            onChange={(e) => {
+                              if (e.target.checked && (!session.prompt || !session.prompt.trim() || promptSaveStatus[session.id] === 'dirty')) {
+                                setAutoReplyError(session.id);
+                                setTimeout(() => setAutoReplyError(null), 3500);
+                                return;
+                              }
+                              handleUpdate(session.id, { isActive: e.target.checked });
+                            }}
                           />
                           <span className="glowing-slider"></span>
                         </label>
                       </div>
 
-                      <div className="option-row">
-                        <div className="option-title">
-                          <Brain size={14} className="cyber-orange" />
-                          <span>Private Chats Active</span>
-                        </div>
-                        <label className="glowing-toggle">
-                          <input
-                            type="checkbox"
-                            checked={session.allowPrivate !== undefined ? !!session.allowPrivate : true}
-                            onChange={(e) => handleUpdate(session.id, { allowPrivate: e.target.checked })}
-                          />
-                          <span className="glowing-slider"></span>
-                        </label>
-                      </div>
 
-                      <div className="option-row">
-                        <div className="option-title">
-                          <Users size={14} className="cyber-orange" />
-                          <span>Group Chats Active</span>
-                        </div>
-                        <label className="glowing-toggle">
-                          <input
-                            type="checkbox"
-                            checked={!!session.allowGroups}
-                            onChange={(e) => handleUpdate(session.id, { allowGroups: e.target.checked })}
-                          />
-                          <span className="glowing-slider"></span>
-                        </label>
-                      </div>
 
                       <div className="option-row">
                         <div className="option-title">
@@ -1646,88 +1713,303 @@ function App() {
                             </label>
                           </div>
 
-                          <div className="input-group">
-                            <label style={{ fontSize: '0.7rem' }}>AI Provider</label>
-                            <select
-                              value={session.aiProvider || 'none'}
-                              onChange={(e) => handleUpdate(session.id, { aiProvider: e.target.value })}
-                              className="input-field-glow"
-                              style={{ paddingLeft: '0.5rem' }}
-                            >
-                              <option value="none">None (Manual Prompt Rules)</option>
-                              <option value="openai">OpenAI (GPT Engine)</option>
-                              <option value="gemini">Google Gemini Engine</option>
-                              <option value="deepseek">DeepSeek AI Engine</option>
-                            </select>
-                          </div>
+                          {(() => {
+                            const currentProvider = getDraftValue(session.id, 'aiProvider', 'none');
+                            const currentApiKey = getDraftValue(session.id, 'aiApiKey', '');
+                            const currentModel = getDraftValue(session.id, 'aiModel', '');
+                            const currentCustomUrl = getDraftValue(session.id, 'aiCustomUrl', '');
+                            const currentMaxContext = getDraftValue(session.id, 'aiMaxContext', 10);
+                            
+                            return (
+                              <>
+                                <div className="input-group">
+                                  <label style={{ fontSize: '0.7rem' }}>AI Provider</label>
+                                  <select
+                                    value={currentProvider}
+                                    onChange={(e) => {
+                                      const newProvider = e.target.value;
+                                      let defaultUrl = '';
+                                      if (newProvider === 'openai') defaultUrl = 'https://api.openai.com/v1/chat/completions';
+                                      else if (newProvider === 'deepseek') defaultUrl = 'https://api.deepseek.com/v1/chat/completions';
+                                      else if (newProvider === 'groq') defaultUrl = 'https://api.groq.com/openai/v1/chat/completions';
+                                      else if (newProvider === 'together') defaultUrl = 'https://api.together.xyz/v1/chat/completions';
+                                      else if (newProvider === 'xai') defaultUrl = 'https://api.x.ai/v1/chat/completions';
+                                      else if (newProvider === 'openrouter') defaultUrl = 'https://openrouter.ai/api/v1/chat/completions';
+                                      
+                                      setDraftValue(session.id, { 
+                                        aiProvider: newProvider,
+                                        aiCustomUrl: defaultUrl,
+                                        aiModel: '' // reset model when provider changes
+                                      });
+                                    }}
+                                    className="input-field-glow"
+                                    style={{ paddingLeft: '0.5rem' }}
+                                  >
+                                    <option value="none">None (Manual Prompt Rules)</option>
+                                    <option value="openai">OpenAI</option>
+                                    <option value="gemini">Google Gemini</option>
+                                    <option value="deepseek">DeepSeek</option>
+                                    <option value="groq">Groq</option>
+                                    <option value="together">Together AI</option>
+                                    <option value="xai">xAI (Grok)</option>
+                                    <option value="openrouter">OpenRouter</option>
+                                  </select>
+                                </div>
 
-                          <div className="input-group">
-                            <label style={{ fontSize: '0.7rem' }}>API Key</label>
-                            <input
-                              type="password"
-                              className="input-field-glow"
-                              placeholder="Enter provider key..."
-                              value={session.aiApiKey || ''}
-                              onChange={(e) => handleUpdate(session.id, { aiApiKey: e.target.value })}
-                              style={{ paddingLeft: '0.5rem' }}
-                            />
-                          </div>
+                                <div className="input-group">
+                                  <label style={{ fontSize: '0.7rem' }}>API Key</label>
+                                  <div style={{ display: 'flex', gap: '0.5rem' }}>
+                                    <input
+                                      type="password"
+                                      className="input-field-glow"
+                                      placeholder="Enter provider key..."
+                                      value={currentApiKey}
+                                      onChange={(e) => setDraftValue(session.id, { aiApiKey: e.target.value })}
+                                      style={{ paddingLeft: '0.5rem', flexGrow: 1 }}
+                                      autoComplete="new-password"
+                                    />
+                                    <button 
+                                      className="btn-premium primary" 
+                                      style={{ padding: '0.4rem 1rem', fontSize: '0.8rem', whiteSpace: 'nowrap' }}
+                                      onClick={async () => {
+                                        try {
+                                          const res = await api.post(`/api/sessions/${session.id}/validate-ai`, {
+                                            aiProvider: currentProvider,
+                                            aiApiKey: currentApiKey,
+                                            aiModel: currentModel,
+                                            aiCustomUrl: currentCustomUrl
+                                          });
+                                          if (res.data.success) {
+                                            alert('Credential successfully validated and saved!');
+                                            await handleUpdate(session.id, { 
+                                              aiProvider: currentProvider,
+                                              aiApiKey: currentApiKey,
+                                              aiModel: currentModel,
+                                              aiCustomUrl: currentCustomUrl,
+                                              aiMaxContext: currentMaxContext
+                                            });
+                                          }
+                                        } catch (error) {
+                                          alert(error.response?.data?.error || 'Validation failed. Credential not valid.');
+                                        }
+                                      }}
+                                    >
+                                      Save & Validate
+                                    </button>
+                                  </div>
+                                </div>
 
-                          <div className="input-group">
-                            <label style={{ fontSize: '0.7rem' }}>Model name</label>
-                            <input
-                              type="text"
-                              className="input-field-glow"
-                              placeholder="e.g. gpt-4, deepseek-chat"
-                              value={session.aiModel || ''}
-                              onChange={(e) => handleUpdate(session.id, { aiModel: e.target.value })}
-                              style={{ paddingLeft: '0.5rem' }}
-                            />
-                          </div>
+                                <div className="input-group">
+                                  <label style={{ fontSize: '0.7rem' }}>Model name</label>
+                                  {currentProvider === 'none' ? (
+                                    <input type="text" className="input-field-glow" disabled placeholder="N/A" style={{ paddingLeft: '0.5rem' }} />
+                                  ) : (
+                                    <select
+                                      className="input-field-glow"
+                                      value={currentModel}
+                                      onChange={(e) => setDraftValue(session.id, { aiModel: e.target.value })}
+                                      style={{ paddingLeft: '0.5rem' }}
+                                    >
+                                      <option value="">Select a model...</option>
+                                      {currentProvider === 'openai' && (
+                                        <>
+                                          <option value="gpt-4o">gpt-4o</option>
+                                          <option value="gpt-4o-mini">gpt-4o-mini</option>
+                                          <option value="gpt-4-turbo">gpt-4-turbo</option>
+                                          <option value="gpt-3.5-turbo">gpt-3.5-turbo</option>
+                                        </>
+                                      )}
+                                      {currentProvider === 'gemini' && (
+                                        <>
+                                          <option value="gemini-1.5-pro">gemini-1.5-pro</option>
+                                          <option value="gemini-1.5-flash">gemini-1.5-flash</option>
+                                          <option value="gemini-1.0-pro">gemini-1.0-pro</option>
+                                        </>
+                                      )}
+                                      {currentProvider === 'deepseek' && (
+                                        <>
+                                          <option value="deepseek-chat">deepseek-chat (V3)</option>
+                                          <option value="deepseek-reasoner">deepseek-reasoner (R1)</option>
+                                        </>
+                                      )}
+                                      {currentProvider === 'groq' && (
+                                        <>
+                                          <option value="llama3-70b-8192">llama3-70b-8192</option>
+                                          <option value="llama3-8b-8192">llama3-8b-8192</option>
+                                          <option value="mixtral-8x7b-32768">mixtral-8x7b-32768</option>
+                                        </>
+                                      )}
+                                      {currentProvider === 'together' && (
+                                        <>
+                                          <option value="meta-llama/Llama-3-70b-chat-hf">Llama-3-70b-chat</option>
+                                          <option value="meta-llama/Llama-3-8b-chat-hf">Llama-3-8b-chat</option>
+                                        </>
+                                      )}
+                                      {currentProvider === 'xai' && (
+                                        <>
+                                          <option value="grok-1">grok-1</option>
+                                          <option value="grok-1.5">grok-1.5</option>
+                                        </>
+                                      )}
+                                      {currentProvider === 'openrouter' && (
+                                        <>
+                                          <option value="meta-llama/llama-3-8b-instruct">llama-3-8b-instruct</option>
+                                          <option value="google/gemini-pro-1.5">gemini-pro-1.5</option>
+                                          <option value="anthropic/claude-3-sonnet">claude-3-sonnet</option>
+                                        </>
+                                      )}
+                                    </select>
+                                  )}
+                                </div>
 
-                          {(session.aiProvider === 'openai' || session.aiProvider === 'deepseek') && (
-                            <div className="input-group">
-                              <label style={{ fontSize: '0.7rem' }}>Custom Endpoint URL (Optional)</label>
-                              <input
-                                type="text"
-                                className="input-field-glow"
-                                placeholder="e.g. https://api.deepseek.com/v1"
-                                value={session.aiCustomUrl || ''}
-                                onChange={(e) => handleUpdate(session.id, { aiCustomUrl: e.target.value })}
-                                style={{ paddingLeft: '0.5rem' }}
-                              />
-                            </div>
-                          )}
+                                {(currentProvider && currentProvider !== 'none' && currentProvider !== 'gemini') && (
+                                  <div className="input-group">
+                                    <label style={{ fontSize: '0.7rem' }}>Endpoint URL</label>
+                                    <input
+                                      type="text"
+                                      className="input-field-glow"
+                                      placeholder="e.g. https://api.openai.com/v1/chat/completions"
+                                      value={currentCustomUrl}
+                                      onChange={(e) => setDraftValue(session.id, { aiCustomUrl: e.target.value })}
+                                      style={{ paddingLeft: '0.5rem' }}
+                                    />
+                                  </div>
+                                )}
 
-                          {session.aiProvider !== 'none' && (
-                            <div className="input-group">
-                              <label style={{ fontSize: '0.7rem' }}>Context History Size (messages)</label>
-                              <input
-                                type="number"
-                                min="1" max="50"
-                                className="input-field-glow"
-                                placeholder="e.g. 10"
-                                value={session.aiMaxContext !== undefined ? session.aiMaxContext : 10}
-                                onChange={(e) => handleUpdate(session.id, { aiMaxContext: e.target.value })}
-                                style={{ paddingLeft: '0.5rem' }}
-                              />
-                            </div>
-                          )}
+                                {currentProvider !== 'none' && (
+                                  <div className="input-group">
+                                    <label style={{ fontSize: '0.7rem' }}>Context History Size (messages)</label>
+                                    <input
+                                      type="number"
+                                      min="1" max="50"
+                                      className="input-field-glow"
+                                      placeholder="e.g. 10"
+                                      value={currentMaxContext}
+                                      onChange={(e) => setDraftValue(session.id, { aiMaxContext: parseInt(e.target.value) || 10 })}
+                                      style={{ paddingLeft: '0.5rem' }}
+                                    />
+                                  </div>
+                                )}
+                              </>
+                            );
+                          })()}
                         </div>
                       )}
                     </div>
 
-                    <div className="card-footer-box">
-                      <div className="prompt-field-label">System Personality Instructions:</div>
-                      <textarea
-                        className="textarea-glow"
-                        value={session.prompt || ''}
-                        onChange={(e) => setSessions(prev => prev.map(s => s.id === session.id ? { ...s, prompt: e.target.value } : s))}
-                        placeholder="e.g. You are a pizza delivery support assistant. Guide users on our menu..."
-                      />
-                      <div className="bento-button-row">
-                        <button className="btn-premium primary" style={{ flexGrow: 1 }} onClick={() => handleUpdate(session.id, { prompt: session.prompt })}>
-                          Save Prompt
+                      <div className="card-footer-box">
+                        <div className="prompt-field-label">System Personality Instructions:</div>
+                        <textarea
+                          className="textarea-glow"
+                          value={session.prompt || ''}
+                          onChange={(e) => {
+                            setSessions(prev => prev.map(s => s.id === session.id ? { ...s, prompt: e.target.value } : s));
+                            setPromptSaveStatus(prev => ({ ...prev, [session.id]: 'dirty' }));
+                          }}
+                          placeholder="e.g. You are a pizza delivery support assistant. Guide users on our menu..."
+                        />
+
+                        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '0.75rem' }}>
+                          {(() => {
+                            const promptStatus = promptSaveStatus[session.id] || (session.prompt ? 'saved' : 'dirty');
+                            let btnText = 'Save';
+                            let btnClass = 'primary';
+                            if (promptStatus === 'saving') {
+                              btnText = <><span className="spinner-mini"></span> Saving...</>;
+                            } else if (promptStatus === 'saved') {
+                              btnClass = 'success';
+                              btnText = <><CheckCircle2 size={16} className="checkmark-animate" /> Saved</>;
+                            }
+                            return (
+                              <button 
+                                className={`btn-premium ${btnClass}`}
+                                disabled={promptStatus === 'saving' || !session.prompt || !session.prompt.trim()}
+                                onClick={async () => {
+                                  setPromptSaveStatus(prev => ({ ...prev, [session.id]: 'saving' }));
+                                  try {
+                                    await handleUpdate(session.id, { 
+                                      prompt: session.prompt, 
+                                      isActive: true, 
+                                      learningUrl: learningUrls[session.id] || '' 
+                                    });
+                                    setPromptSaveStatus(prev => ({ ...prev, [session.id]: 'saved' }));
+                                  } catch (err) {
+                                    console.error(err);
+                                    setPromptSaveStatus(prev => ({ ...prev, [session.id]: 'dirty' }));
+                                  }
+                                }}
+                              >
+                                {btnText}
+                              </button>
+                            );
+                          })()}
+                        </div>
+
+                        <div style={{ marginTop: '1rem', marginBottom: '1rem', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '1rem' }}>
+                          <div className="prompt-field-label">Intelligence Hub (Website Data):</div>
+                          <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.5rem' }}>
+                            <input
+                              type="text"
+                              className="input-field-glow"
+                              placeholder="Enter website URL to train AI (e.g., https://example.com)"
+                              value={learningUrls[session.id] || ''}
+                              onChange={(e) => setLearningUrls({ ...learningUrls, [session.id]: e.target.value })}
+                              style={{ paddingLeft: '0.5rem', flexGrow: 1 }}
+                            />
+                            <button 
+                              className="btn-premium primary"
+                              disabled={isTraining[session.id]}
+                              style={{ whiteSpace: 'nowrap' }}
+                              onClick={async () => {
+                                const url = learningUrls[session.id];
+                                if (!url) return alert('Please enter a website URL.');
+                                
+                                setIsTraining({ ...isTraining, [session.id]: true });
+                                try {
+                                  const res = await api.post(`/api/sessions/${session.id}/train-website`, { url });
+                                  if (res.data.generatedPrompt) {
+                                    // Populate generated prompt locally without saving
+                                    setSessions(prev => prev.map(s => s.id === session.id ? { ...s, prompt: res.data.generatedPrompt } : s));
+                                    // Set prompt save status to dirty so they can manually save
+                                    setPromptSaveStatus(prev => ({ ...prev, [session.id]: 'dirty' }));
+                                  }
+                                } catch (error) {
+                                  alert(error.response?.data?.error || 'Failed to train AI from website.');
+                                } finally {
+                                  setIsTraining({ ...isTraining, [session.id]: false });
+                                }
+                              }}
+                            >
+                              {isTraining[session.id] ? 'Training...' : 'Scrape & Train'}
+                            </button>
+                          </div>
+                          <p style={{ fontSize: '0.65rem', color: '#a0a0c0', margin: 0 }}>
+                            The AI will read the website and automatically write a tailored system prompt for your business. (Make sure you saved your AI credentials above first).
+                          </p>
+                        </div>
+                      <div className="bento-button-row" style={{ position: 'relative', flexWrap: 'wrap' }}>
+                        {livePreviewError === session.id && (
+                          <div style={{ position: 'absolute', top: '-22px', left: 0, color: '#ef4444', fontSize: '0.8rem', width: '100%' }}>
+                            <span style={{fontWeight: 'bold'}}>Error:</span> System prompt must be saved to test your agent.
+                          </div>
+                        )}
+                        <button 
+                          className="btn-premium secondary" 
+                          style={{ flexGrow: 1 }} 
+                          onClick={() => {
+                            if (!session.prompt || !session.prompt.trim() || promptSaveStatus[session.id] === 'dirty') {
+                              setLivePreviewError(session.id);
+                              setTimeout(() => setLivePreviewError(null), 3500);
+                              return;
+                            }
+                            setSelectedAgentForSandbox(session.id);
+                            setSandboxMessages([
+                              { sender: 'agent', text: `Hello! I am ${session.name}. Test chat with me here to see how I reply based on my prompts or rules!` }
+                            ]);
+                            setPopupSandboxSession(session.id);
+                          }}
+                        >
+                          <Play size={16} /> Live Preview
                         </button>
                         {(session.status === 'ready' || session.status === 'authenticated') && (
                           <button className="btn-premium danger-soft" onClick={() => logoutSession(session.id)}>
@@ -1740,11 +2022,7 @@ function App() {
                       </div>
                     </div>
 
-                    {session.aiEnabled && (
-                      <div className="indicator-ai-badge">
-                        <Zap size={10} /> AI: {session.aiProvider}
-                      </div>
-                    )}
+
 
                   </div>
                 ))}
@@ -2001,8 +2279,8 @@ function App() {
                                 fetchLivechatMessages(livechatSelectedAgent, chat.contact);
                               }}
                             >
-                              <div className={`livechat-avatar ${isGroup ? 'group' : ''}`}>
-                                {isGroup ? 'Gp' : contactName.slice(-4)}
+                              <div className={`livechat-avatar`}>
+                                {contactName.slice(-4)}
                               </div>
                               <div className="livechat-thread-details">
                                 <h4>{chat.contact}</h4>
@@ -2040,7 +2318,7 @@ function App() {
                             <p>Live Sync Active</p>
                           </div>
                           <span className="pill-indicator" style={{ background: 'var(--accent-glow)' }}>
-                            {livechatSelectedContact.endsWith('@g.us') ? 'WhatsApp Group' : 'Private Conversation'}
+                            {livechatSelectedContact}
                           </span>
                         </div>
 
@@ -3214,9 +3492,8 @@ function App() {
           <div>
             <header className="page-header">
               <div className="page-title-area">
-                <div className="welcome-chip">📊 Analytics Workspace</div>
+                <div className="welcome-chip">Analytics Workspace</div>
                 <h1>System Activity Overview</h1>
-                <p>Unified charts showing message directions, hourly active contacts, and top communication statistics.</p>
               </div>
             </header>
 
@@ -3313,7 +3590,7 @@ function App() {
                       {analyticsData.dailyStats && analyticsData.dailyStats.length > 0 && (
                         <div className="svg-chart-wrapper">
                           <div className="svg-chart-title">
-                            <span>📈 7-Day Traffic Statistics</span>
+                            <span>7-Day Traffic Statistics</span>
                             <div className="svg-chart-legend">
                               <div className="legend-item">
                                 <span className="legend-color-box incoming"></span>
@@ -3380,33 +3657,7 @@ function App() {
                         </div>
                       )}
 
-                      <div className="board-container">
-                        <h3 style={{ fontSize: '1.2rem', marginBottom: '1.5rem' }}>Top 10 Active WhatsApp Jids (Messages volume)</h3>
-                        {analyticsData.topContacts?.length === 0 ? (
-                          <p className="text-secondary">No recorded active contacts found in DB.</p>
-                        ) : (
-                          <div className="crm-table-container">
-                            <table className="crm-table">
-                              <thead>
-                                <tr>
-                                  <th style={{ width: '80px' }}>Rank</th>
-                                  <th>Contact Number (Jid)</th>
-                                  <th>Total Message Exchanged</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {analyticsData.topContacts?.map((contact, idx) => (
-                                  <tr key={idx}>
-                                    <td><span className="pill-indicator">#{idx + 1}</span></td>
-                                    <td><span className="crm-contact-id">{contact.contact}</span></td>
-                                    <td style={{ fontWeight: '700', color: 'var(--accent-light)' }}>{contact.count}</td>
-                                  </tr>
-                                ))}
-                              </tbody>
-                            </table>
-                          </div>
-                        )}
-                      </div>
+
                     </div>
                   );
                 })()}
@@ -3792,6 +4043,81 @@ function App() {
           </div>
         </div>
       )}
+
+      {/* Sandbox Modal Overlay */}
+      {popupSandboxSession && (() => {
+        const s = sessions.find(sess => sess.id === popupSandboxSession);
+        if (!s) return null;
+        return (
+          <div className="modal-overlay" onClick={() => setPopupSandboxSession(null)} style={{ zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(8px)', background: 'rgba(0,0,0,0.4)' }}>
+            <div className="modal-content" onClick={e => e.stopPropagation()} style={{ width: '360px', height: '780px', maxHeight: '90vh', padding: '0', background: 'linear-gradient(180deg, #13151a 0%, #0a0a0c 100%)', border: '12px solid #000', borderRadius: '48px', overflow: 'hidden', display: 'flex', flexDirection: 'column', boxShadow: '0 0 0 2px rgba(255,255,255,0.15), 0 40px 80px -15px rgba(0,0,0,0.9), inset 0 0 0 1px rgba(255,255,255,0.05)', position: 'relative' }}>
+              
+              {/* Dynamic Island / iPhone Notch */}
+              <div style={{ position: 'absolute', top: '10px', left: '50%', transform: 'translateX(-50%)', width: '105px', height: '32px', background: '#000', borderRadius: '24px', zIndex: 10, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', padding: '0 10px', boxShadow: 'inset 0 0 2px rgba(255,255,255,0.05)' }}>
+                {/* Camera dot */}
+                <div style={{ width: '10px', height: '10px', borderRadius: '50%', background: '#111', border: '1px solid #1a1a1a', boxShadow: 'inset 0 0 4px rgba(255,255,255,0.1)' }}></div>
+              </div>
+              
+              {/* Header */}
+              <div className="sandbox-chat-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '2.5rem 1.25rem 1rem', borderBottom: '1px solid rgba(255,255,255,0.05)', background: 'rgba(20,20,25,0.85)', backdropFilter: 'blur(12px)', zIndex: 5 }}>
+                <h3 style={{ margin: 0, fontSize: '1rem', display: 'flex', alignItems: 'center', gap: '0.6rem', fontWeight: 600 }}>
+                  <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: 'linear-gradient(135deg, var(--cyber-blue, #38bdf8), var(--accent, #a78bfa))', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 2px 8px rgba(56, 189, 248, 0.4)' }}>
+                    <MessageSquare size={16} color="#fff" />
+                  </div>
+                  {s.name}
+                </h3>
+                <button 
+                  onClick={() => setPopupSandboxSession(null)}
+                  style={{ background: 'rgba(255,255,255,0.1)', border: '1px solid rgba(255,255,255,0.05)', color: '#fff', cursor: 'pointer', padding: '0.4rem', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.2s', boxShadow: '0 2px 6px rgba(0,0,0,0.3)' }}
+                >
+                  <X size={14} />
+                </button>
+              </div>
+
+              {/* Chat Area */}
+              <div className="sandbox-messages-scroller" ref={chatScrollerRef} style={{ flexGrow: 1, height: '0', padding: '1.25rem 1rem', overflowY: 'auto', background: 'transparent' }}>
+                {sandboxMessages.map((msg, idx) => (
+                  <div key={idx} className={`chat-bubble-row ${msg.sender}`}>
+                    <div className="chat-bubble" style={{ boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}>
+                      {msg.text}
+                    </div>
+                  </div>
+                ))}
+
+                {sandboxTyping && (
+                  <div className="chat-bubble-row agent">
+                    <div className="chat-bubble" style={{ padding: '0.6rem 1rem', boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}>
+                      <div className="typing-indicator">
+                        <span className="typing-dot"></span>
+                        <span className="typing-dot"></span>
+                        <span className="typing-dot"></span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Input Area */}
+              <form className="sandbox-chat-input-bar" onSubmit={handleSandboxSend} style={{ borderTop: '1px solid rgba(255,255,255,0.05)', padding: '0.85rem 1rem 2.25rem 1rem', display: 'flex', gap: '0.6rem', background: 'rgba(20,20,25,0.85)', backdropFilter: 'blur(12px)', zIndex: 5 }}>
+                <input
+                  type="text"
+                  className="sandbox-input"
+                  placeholder="Message..."
+                  value={sandboxInput}
+                  onChange={(e) => setSandboxInput(e.target.value)}
+                  style={{ flexGrow: 1, border: '1px solid rgba(255,255,255,0.1)', padding: '0.8rem 1.25rem', borderRadius: '24px', background: 'rgba(0,0,0,0.6)', color: '#fff', outline: 'none', fontSize: '0.95rem', boxShadow: 'inset 0 2px 4px rgba(0,0,0,0.2)' }}
+                />
+                <button type="submit" className="sandbox-send-btn" style={{ background: 'var(--cyber-blue, #38bdf8)', color: '#fff', border: 'none', width: '46px', height: '46px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', boxShadow: '0 4px 16px rgba(56, 189, 248, 0.4)', flexShrink: 0 }}>
+                  <Send size={18} style={{ transform: 'translateX(-1px)' }} />
+                </button>
+              </form>
+              
+              {/* Home indicator bar */}
+              <div style={{ position: 'absolute', bottom: '8px', left: '50%', transform: 'translateX(-50%)', width: '135px', height: '5px', background: 'rgba(255,255,255,0.85)', borderRadius: '10px', zIndex: 10, boxShadow: '0 1px 2px rgba(0,0,0,0.3)' }}></div>
+            </div>
+          </div>
+        );
+      })()}
 
     </div>
   );
