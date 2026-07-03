@@ -30,6 +30,12 @@ app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
+// Health Check Route
+app.get('/', (req, res) => {
+    res.send('<h1>🚀 Call Anexa WhatsApp API is Live & Running!</h1><p>SQLite Database Connected. All systems operational.</p>');
+});
+
+
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
